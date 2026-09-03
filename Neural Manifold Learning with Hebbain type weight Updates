@@ -1,0 +1,1863 @@
+
+function illcond_SE_v36()
+
+    clc; close all; rng(42);
+
+    % ===== MATPOWER PATH =====
+    matpower_path = 'D:\Asjad\Masters\Masters Thesis\MATPOWER\matpower8.0';
+    if exist(matpower_path, 'dir')
+        addpath(genpath(matpower_path));
+        rehash path;
+        use_matpower = true;
+    else
+        fprintf('  [WARN] MATPOWER not found. Using built-in data.\n');
+        use_matpower = false;
+    end
+
+    measMode    = 'HYBRID';
+    methodNames = {'WLS-Std', 'WLS-Mod (LM)', 'DMHN'};
+    colors      = {[0 0 0], [0 0.45 0.74], [0.85 0.33 0.10]};
+    lineStyles  = {'-', '--', '-.'};
+    markers     = {'s', '^', 'o'};
+    nMethods    = 3;
+
+    sysNums  = [11, 13, 20, 14, 57];
+    sysNames = {'11-bus', '13-bus', '20-bus', 'IEEE 14-bus', 'IEEE 57-bus'};
+    nSys     = 5;
+
+    tol_grad = 1e-6;
+    tol_dx   = 1e-6;
+    rmse_lim = 1e-1;
+
+    SEP  = repmat('=', 1, 100);
+    SEP2 = repmat('-', 1, 100);
+    fprintf('\n%s\n  POWER SYSTEM STATE ESTIMATION – v36 (MAX_ITER=400)\n%s\n\n', SEP, SEP);
+
+    all_hists   = cell(nSys, nMethods);
+    all_rmseV   = zeros(nSys, nMethods);
+    all_rmseA   = zeros(nSys, nMethods);
+    all_conv    = false(nSys, nMethods);
+    all_x_final = cell(nSys, nMethods);
+    sys_data    = cell(nSys, 1);
+
+    true_Vm_all = cell(nSys, 1);
+    true_Th_all = cell(nSys, 1);
+
+    %======================================================================
+    %  BUILD SYSTEMS
+    %======================================================================
+    fprintf('  BUILDING TEST SYSTEMS\n%s\n', SEP2);
+
+    for si = 1:nSys
+        num = sysNums(si);
+
+        if num == 14
+            mpc = build_ieee14_mpc();
+        elseif num == 57 && use_matpower
+            mpc = build_from_matpower('case57');
+        elseif num == 57
+            mpc = build_ieee57_mpc();
+        else
+            mpc = build_mpc(num);
+        end
+
+        n  = mpc.n;
+        nb = size(mpc.branch, 1);
+        pb = get_pmu_buses(num, n);
+        [Ybus, Yf] = build_Ybus_general(mpc, n);
+
+        sl = find(mpc.bus(:,2) == 1);
+        if isempty(sl), sl = 1; end
+
+        [th_true, Vm_true, pf_ok] = run_pf_robust(mpc, Ybus, n, sl);
+
+        if pf_ok
+            fprintf('  ✓ %s: PF CONVERGED\n', sysNames{si});
+        else
+            fprintf('  ⚠ %s: PF FAILED - using FLAT START\n', sysNames{si});
+            th_true = zeros(n, 1);
+            Vm_true = ones(n, 1);
+        end
+
+        true_Vm_all{si} = Vm_true;
+        true_Th_all{si} = th_true;
+
+        fprintf('      Vm_true (first 5):'); fprintf(' %.4f', Vm_true(1:min(5,n))); fprintf('\n');
+        fprintf('      Th_true (first 5):'); fprintf(' %.2f', th_true(1:min(5,n))*180/pi); fprintf(' deg\n');
+
+        [z_true, meas] = build_meas_general(mpc, Ybus, Yf, th_true, Vm_true, n, nb, pb, measMode, num);
+        rng(42);
+        z    = z_true + meas.sigma .* randn(size(z_true));
+        Rinv = diag(1 ./ meas.sigma.^2);
+        Rd   = diag(Rinv);
+        nm   = numel(z);
+        Nst  = 2*n - 1;
+        dof  = max(nm - Nst, 1);
+
+        x0 = [zeros(n-1, 1); ones(n, 1)];
+        x0 = clip_x(x0, n);
+
+        H0       = jac_H_general(x0, meas, Ybus, Yf, mpc, n, nm);
+        kappaHWH = cond(H0' * Rinv * H0);
+
+        fprintf('      n=%d, nm=%d, dof=%d, κ(HWH)=%.2e\n\n', ...
+            n, nm, dof, kappaHWH);
+
+        d.mpc = mpc; d.n = n; d.nb = nb; d.Ybus = Ybus; d.Yf = Yf;
+        d.th_true = th_true; d.Vm_true = Vm_true;
+        d.z = z; d.meas = meas; d.Rd = Rd; d.nm = nm; d.x0 = x0;
+        d.kappaHWH = kappaHWH; d.dof = dof; d.pf_ok = pf_ok;
+        sys_data{si} = d;
+    end
+
+    %======================================================================
+    %  RUN STATE ESTIMATION
+    %======================================================================
+    fprintf('%s\n  RUNNING STATE ESTIMATION (tol_grad = %.0e, tol_dx = %.0e)\n%s\n', ...
+        SEP, tol_grad, tol_dx, SEP2);
+
+    for si = 1:nSys
+        d = sys_data{si};
+        n = d.n; Ybus = d.Ybus; Yf = d.Yf; mpc = d.mpc;
+        z = d.z; meas = d.meas; Rd = d.Rd; nm = d.nm; x0 = d.x0;
+        Vm_true = d.Vm_true; th_true = d.th_true;
+
+        fprintf('\n[%s] (κ=%.2e)\n', sysNames{si}, d.kappaHWH);
+        fprintf('%-12s %8s %6s %10s %10s %10s %8s\n', ...
+            'Method','Conv','Iter','RMSE_V','RMSE_Th','J(x)','Time(s)');
+
+        p1 = struct('MAX_ITER', 150, 'tol', tol_grad, 'tol_dx', tol_dx, ...
+                    'kappa', d.kappaHWH);
+        t0 = tic;
+        [x1, h1] = se_wls_correct(z, meas, Ybus, Yf, mpc, n, nm, Rd, x0, p1);
+        t1 = toc(t0);
+        [rv1, ra1] = rmse_state_full(x1, Vm_true, th_true, n);
+        h1 = audit_general(h1, x1, z, meas, Ybus, Yf, mpc, n, nm, Rd, ...
+            rv1, ra1, tol_grad, tol_dx, rmse_lim, 'WLS-Std');
+
+        p2 = struct('MAX_ITER', 200, 'tol', tol_grad, 'tol_dx', tol_dx, ...
+                    'kappa', d.kappaHWH);
+        t0 = tic;
+        [x2, h2] = se_wls_lm_correct(z, meas, Ybus, Yf, mpc, n, nm, Rd, x0, p2);
+        t2 = toc(t0);
+        [rv2, ra2] = rmse_state_full(x2, Vm_true, th_true, n);
+        h2 = audit_general(h2, x2, z, meas, Ybus, Yf, mpc, n, nm, Rd, ...
+            rv2, ra2, tol_grad, tol_dx, rmse_lim, 'WLS-Mod');
+
+        p3 = build_dmhn_params(d.kappaHWH, n, tol_grad, tol_dx);
+        t0 = tic;
+        [x3, h3] = se_dmhn_adaptive_natural_stop(z, meas, Ybus, Yf, mpc, n, nm, Rd, x0, p3);
+        t3 = toc(t0);
+        [rv3, ra3] = rmse_state_full(x3, Vm_true, th_true, n);
+        h3 = audit_general(h3, x3, z, meas, Ybus, Yf, mpc, n, nm, Rd, ...
+            rv3, ra3, tol_grad, tol_dx, rmse_lim, 'DMHN');
+
+        hs  = {h1, h2, h3};
+        rsV = [rv1, rv2, rv3];
+        rsA = [ra1, ra2, ra3];
+        ts  = [t1, t2, t3];
+
+        for mi = 1:nMethods
+            all_hists{si, mi}   = hs{mi};
+            all_rmseV(si, mi)   = rsV(mi);
+            all_rmseA(si, mi)   = rsA(mi);
+            all_conv(si, mi)    = hs{mi}.conv;
+            all_x_final{si, mi} = hs{mi}.x_final;
+
+            cs = sprintf('%d', hs{mi}.conv);
+            if hs{mi}.conv, cs = ['✓' cs]; else, cs = ['✗' cs]; end
+
+            fprintf('%-12s %8s %6d %10.2e %10.2e %10.2f %8.3f [%s]\n', ...
+                methodNames{mi}, cs, hs{mi}.iters, rsV(mi), rsA(mi)*180/pi, ...
+                hs{mi}.J_final, ts(mi), hs{mi}.status);
+        end
+    end
+
+    %======================================================================
+    %  HYPERPARAMETER SENSITIVITY ANALYSIS (13-BUS AND 57-BUS)
+    %======================================================================
+    fprintf('\n%s\n  HYPERPARAMETER SENSITIVITY ANALYSIS (13-BUS AND 57-BUS, MAX_ITER=400)\n%s\n', SEP, SEP2);
+    fprintf('  Running 5x5 sweep for 13-bus and IEEE 57-bus systems\n');
+    fprintf('  This may take several minutes...\n\n');
+
+    % Run for 13-bus (index 2) and 57-bus (index 5)
+    sensitivity_results = run_sensitivity_analysis(sys_data, [2, 5], sysNames);
+
+    %======================================================================
+    %  SAVE SENSITIVITY RESULTS
+    %======================================================================
+    save('sensitivity_results.mat', 'sensitivity_results');
+    fprintf('  Sensitivity results saved to sensitivity_results.mat\n');
+
+    %======================================================================
+    %  GENERATE SENSITIVITY FIGURES
+    %======================================================================
+    fig_sensitivity_heatmaps(sensitivity_results, sysNames);
+    fig_sensitivity_iterations(sensitivity_results, sysNames);
+    fig_sensitivity_runtime(sensitivity_results, sysNames);
+    fig_sensitivity_rmse(sensitivity_results, sysNames);
+
+    %======================================================================
+    %  FIGURES
+    %======================================================================
+    fprintf('\n%s\n  GENERATING FIGURES\n%s\n', SEP, SEP2);
+
+    fig_energy_all_systems_DMHN_only(all_hists, sysNames, methodNames, colors, lineStyles);
+    fig_combined_gradient(all_hists, sysNames, methodNames, colors, lineStyles, tol_grad);
+    fig_combined_step(all_hists, sysNames, methodNames, colors, lineStyles, tol_dx);
+    fig_rmse_bars(all_rmseV, all_rmseA, sysNames, methodNames);
+    fig_bus_errors_voltage(all_x_final, true_Vm_all, sysNames, methodNames, colors, markers);
+    fig_bus_errors_angle(all_x_final, true_Th_all, sysNames, methodNames, colors, markers);
+
+    %======================================================================
+    %  SUMMARY TABLE
+    %======================================================================
+    fprintf('\n%s\n  FINAL SUMMARY\n%s\n', SEP, SEP);
+    fprintf('┌────────────────┬──────────────────┬────────────┬────────────┬─────────────┬────────────┐\n');
+    fprintf('│ System         │ Method           │ Converged  │ RMSE_V     │ RMSE_Th(deg)│ Iterations │\n');
+    fprintf('├────────────────┼──────────────────┼────────────┼────────────┼─────────────┼────────────┤\n');
+
+    for si = 1:nSys
+        for mi = 1:nMethods
+            cs = '✓ YES'; if ~all_conv(si,mi), cs = '✗ NO '; end
+            fprintf('│ %-14s │ %-16s │ %-10s │ %10.3e │ %11.3e │ %10d │\n', ...
+                sysNames{si}, methodNames{mi}, cs, ...
+                all_rmseV(si,mi), all_rmseA(si,mi)*180/pi, all_hists{si,mi}.iters);
+        end
+        if si < nSys
+            fprintf('├────────────────┼──────────────────┼────────────┼────────────┼─────────────┼────────────┤\n');
+        end
+    end
+    fprintf('└────────────────┴──────────────────┴────────────┴────────────┴─────────────┴────────────┘\n');
+    fprintf('\n%s\n  DONE\n%s\n', SEP, SEP);
+end
+
+%==========================================================================
+%  BUILD DMHN PARAMETERS - MODIFIED FOR 400 ITERATIONS
+%==========================================================================
+function p = build_dmhn_params(kHWH, n, tol_g, tol_dx)
+    p.MAX_ITER = 400;
+    p.chi2     = 0;
+    p.tol_grad = tol_g;
+    p.tol_dx   = tol_dx;
+    p.mu0      = min(1.0, 1e-3 * max(1, log10(kHWH)));
+    p.mu_max   = 1e10;
+    p.eta_rej  = 1e-4;
+    p.max_ls   = 30;
+    p.svd_tol  = 1e-10;
+
+    p.max_angle_step = 0.05;
+    p.max_volt_step  = 0.025;
+
+    p.phi_scale     = 0.8;
+    p.wd_scale      = 0.3;
+    p.wd_diag_scale = 0.5;
+    p.id_scale      = 1.5;
+    p.eta_A         = 0.05;
+    p.eta_Wi        = 0.02;
+    p.A_init        = 0.05;
+    p.Wi_init       = 0.01;
+    p.A_max         = 15.0;
+    p.Wi_max        = 8.0;
+    
+    p.forgetting    = 0.01;
+    p.alpha_WD_scale = 1.0;
+    p.alpha_ID_scale = 1.0;
+
+    if kHWH > 1e3
+        p.wd_scale      = 0.8;
+        p.wd_diag_scale = 1.2;
+        p.eta_A         = 0.10;
+        p.eta_Wi        = 0.04;
+        p.id_scale      = 2.0;
+        p.mu0           = 0.5;
+        p.forgetting    = 0.02;
+    end
+end
+
+%==========================================================================
+%  SENSITIVITY ANALYSIS FUNCTION
+%==========================================================================
+function results = run_sensitivity_analysis(sys_data, system_indices, sysNames)
+    % Run 5x5 sweep for specified systems
+    % alpha_WD = [0.25, 0.5, 1.0, 2.0, 4.0]
+    % alpha_ID = [0.25, 0.5, 1.0, 2.0, 4.0]
+    
+    alpha_values = [0.25, 0.5, 1.0, 2.0, 4.0];
+    n_alphas = length(alpha_values);
+    
+    results = struct();
+    results.systems = {};
+    results.alpha_WD = alpha_values;
+    results.alpha_ID = alpha_values;
+    results.RMSE_V = [];
+    results.RMSE_A = [];
+    results.J_final = [];
+    results.iterations = [];
+    results.time = [];
+    results.converged = [];
+    
+    for sys_idx = 1:length(system_indices)
+        si = system_indices(sys_idx);
+        d = sys_data{si};
+        sysName = sysNames{si};
+        
+        fprintf('  Running sweep for %s...\n', sysName);
+        fprintf('  WD\\ID');
+        for ai = 1:n_alphas
+            fprintf('  %6.2f', alpha_values(ai));
+        end
+        fprintf('\n');
+        
+        RMSE_V_mat = zeros(n_alphas, n_alphas);
+        RMSE_A_mat = zeros(n_alphas, n_alphas);
+        J_mat = zeros(n_alphas, n_alphas);
+        iter_mat = zeros(n_alphas, n_alphas);
+        time_mat = zeros(n_alphas, n_alphas);
+        conv_mat = false(n_alphas, n_alphas);
+        
+        for wi = 1:n_alphas
+            fprintf('  %6.2f', alpha_values(wi));
+            for ii = 1:n_alphas
+                alpha_WD = alpha_values(wi);
+                alpha_ID = alpha_values(ii);
+                
+                p = build_dmhn_params(d.kappaHWH, d.n, 1e-6, 1e-6);
+                p.alpha_WD_scale = alpha_WD;
+                p.alpha_ID_scale = alpha_ID;
+                p.MAX_ITER = 400;
+                
+                try
+                    t0 = tic;
+                    [x, h] = se_dmhn_with_scaled_params(d.z, d.meas, d.Ybus, d.Yf, ...
+                        d.mpc, d.n, d.nm, d.Rd, d.x0, p);
+                    t = toc(t0);
+                    
+                    [rv, ra] = rmse_state_full(x, d.Vm_true, d.th_true, d.n);
+                    
+                    RMSE_V_mat(wi, ii) = rv;
+                    RMSE_A_mat(wi, ii) = ra;
+                    J_mat(wi, ii) = h.J_final;
+                    iter_mat(wi, ii) = h.iters;
+                    time_mat(wi, ii) = t;
+                    conv_mat(wi, ii) = h.conv;
+                    
+                    fprintf('  %6.2f', iter_mat(wi, ii));
+                catch ME
+                    fprintf('  %6s', 'FAIL');
+                    % Surface the real error instead of silently discarding it.
+                    fprintf('\n    [alpha_WD=%.2f, alpha_ID=%.2f] %s: %s\n', ...
+                        alpha_WD, alpha_ID, ME.identifier, ME.message);
+                    for kk = 1:numel(ME.stack)
+                        fprintf('      at %s (line %d)\n', ME.stack(kk).name, ME.stack(kk).line);
+                    end
+                    RMSE_V_mat(wi, ii) = NaN;
+                    RMSE_A_mat(wi, ii) = NaN;
+                    J_mat(wi, ii) = NaN;
+                    iter_mat(wi, ii) = NaN;
+                    time_mat(wi, ii) = NaN;
+                    conv_mat(wi, ii) = false;
+                end
+            end
+            fprintf('\n');
+        end
+        
+        results.systems{end+1} = sysName;
+        results.RMSE_V = cat(3, results.RMSE_V, RMSE_V_mat);
+        results.RMSE_A = cat(3, results.RMSE_A, RMSE_A_mat);
+        results.J_final = cat(3, results.J_final, J_mat);
+        results.iterations = cat(3, results.iterations, iter_mat);
+        results.time = cat(3, results.time, time_mat);
+        results.converged = cat(3, results.converged, conv_mat);
+        
+        fprintf('  Completed sweep for %s\n\n', sysName);
+    end
+end
+
+%==========================================================================
+%  DMHN WITH SCALED PARAMETERS
+%==========================================================================
+function [x, hist] = se_dmhn_with_scaled_params(z, meas, Ybus, Yf, mpc, n, nm, Rd, x0, par)
+    Nst  = 2*n - 1;
+    x    = clip_x(x0, n);
+    K    = par.MAX_ITER;
+    hist = init_hist(K);
+    hist.x_final = x;
+
+    tol_g  = par.tol_grad;
+    tol_dx = par.tol_dx;
+
+    x_best = x;
+    J_best = inf;
+    mu     = par.mu0;
+    nu     = 2.0;
+
+    sigma_mean = mean(1 ./ sqrt(max(diag(diag(Rd)), 1e-12)));
+    ds = dmhn_init_general(Nst, par);
+    dt = 0.20;
+    
+    [~, ~, ~, g0, ~] = compute_all_general(x, z, meas, Ybus, Yf, mpc, n, nm, Rd);
+    g0_norm = max(norm(g0), 1e-12);
+    
+    lambda = par.forgetting;
+    
+    WD_prev = zeros(Nst);
+    ID_prev = zeros(Nst, 1);
+    x_prev = x;
+    
+    tol_state = 1e-6;
+    tol_WD = 1e-5;
+    tol_ID = 1e-5;
+    
+    alpha_WD_scale = par.alpha_WD_scale;
+    alpha_ID_scale = par.alpha_ID_scale;
+
+    for k = 1:K
+        x = clip_x(x, n);
+        [r, H, J_t, g, G] = compute_all_general(x, z, meas, Ybus, Yf, mpc, n, nm, Rd);
+        gn_v = sgi_general(g, G);
+        g_norm = norm(g);
+
+        hist.J(k)  = J_t;
+        hist.gn(k) = gn_v;
+        hist.mu(k) = mu;
+
+        if J_t < J_best
+            J_best = J_t;
+            x_best = x;
+        end
+
+        alpha = min(1.0, g_norm / g0_norm);
+        
+        [Q_eff, g_eff, WD, ID, ds] = dmhn_effective_system_adaptive_scaled(...
+            G, g, r, sigma_mean, x, n, ds, par, alpha, lambda, alpha_WD_scale, alpha_ID_scale);
+        
+        g_nrm = max(g_norm, 1e-8);
+        phi = tanh(g / g_nrm);
+        E_D = 0.5 * phi' * WD * phi;
+        E_I = phi' * ds.Wi * phi;
+        E_total = J_t + real(E_D) + real(E_I);
+        hist.E(k) = E_total;
+        
+        state_change = norm(x - x_prev, inf) / max(norm(x, inf), 1e-12);
+        x_prev = x;
+        WD_change = norm(WD - WD_prev, 'fro') / max(norm(WD_prev, 'fro'), 1e-12);
+        WD_prev = WD;
+        ID_change = norm(ID - ID_prev) / max(norm(ID_prev), 1e-12);
+        ID_prev = ID;
+        hist.step(k) = state_change;
+        
+        if state_change < tol_state && WD_change < tol_WD && ID_change < tol_ID
+            hist = trim_hist(hist, k, 'NATURAL_CONV');
+            hist.conv    = true;
+            hist.x_final = x_best;
+            hist.J_final = J_best;
+            x = x_best;
+            return;
+        end
+
+        diagQ = max(abs(diag(Q_eff)), 1e-14);
+        Q_lm  = Q_eff + mu * diag(diagQ);
+        Q_lm  = 0.5*(Q_lm + Q_lm');
+
+        [Qp, Ds] = struct_precond_general(Q_lm);
+        dp = solve_svd_general(Qp, Ds .* g_eff, par.svd_tol);
+        d  = Ds .* dp;
+        d(~isfinite(d)) = 0;
+        d  = clip_step_general(d, n, par);
+
+        gTd = g_eff' * d;
+        if ~isfinite(gTd) || gTd >= 0
+            d   = -g_eff;
+            d   = clip_step_general(d, n, par);
+            gTd = g_eff' * d;
+            if gTd >= 0, d = zeros(Nst,1); end
+        end
+
+        alpha_step = 1.0;
+        accepted  = false;
+        rho_k     = -inf;
+        pred_full = -g_eff'*d - 0.5*(d'*Q_lm*d);
+        if ~isfinite(pred_full) || pred_full <= 0
+            pred_full = 1e-4 * max(-gTd, 1e-12);
+        end
+
+        for ls = 1:par.max_ls
+            xt = clip_x(x + alpha_step*dt*d, n);
+            [~,~,Jt,~,~] = compute_all_general(xt, z, meas, Ybus, Yf, mpc, n, nm, Rd);
+            act   = J_t - Jt;
+            rho_k = act / max(alpha_step*dt*pred_full, 1e-18);
+            if isfinite(Jt) && act > 0 && rho_k > par.eta_rej
+                accepted = true;
+                break;
+            end
+            alpha_step = alpha_step * 0.5;
+            if alpha_step < 1e-14, break; end
+        end
+
+        if accepted
+            hist.step(k) = norm(alpha_step*dt*d, inf);
+            x    = clip_x(x + alpha_step*dt*d, n);
+            mu   = mu * max(1/3, 1-(2*rho_k-1)^3);
+            nu   = 2.0;
+        else
+            hist.step(k) = 0;
+            mu = min(par.mu_max, mu*nu);
+            nu = 2*nu;
+        end
+    end
+    
+    x    = x_best;
+    hist = trim_hist(hist, K, 'MAX_ITER');
+    hist.x_final = x;
+    hist.J_final = J_best;
+
+    [~,~,Jf,gf,Gf] = compute_all_general(x, z, meas, Ybus, Yf, mpc, n, nm, Rd);
+    if Jf <= par.chi2 && sgi_general(gf,Gf) <= tol_g
+        hist.conv   = true;
+        hist.status = 'TRUE_CONV';
+    end
+end
+
+%==========================================================================
+%  DMHN EFFECTIVE SYSTEM WITH SCALED PARAMETERS
+%==========================================================================
+function [Q_eff, g_eff, WD, ID, dmhn_state] = dmhn_effective_system_adaptive_scaled(...
+        G, g, r, sigma_mean, x, n, dmhn_state, par, alpha, lambda, alpha_WD_scale, alpha_ID_scale)
+
+    Nst  = numel(g);
+    g_nrm = max(norm(g), 1e-8);
+    u_c   = g / g_nrm;
+    T_leak = sqrt(max(abs(diag(G)), 1e-14));
+    phi_uc = tanh(u_c / par.phi_scale);
+
+    A    = dmhn_state.A;
+    Wi   = dmhn_state.Wi;
+    
+    A_new = (1 - lambda) * A + par.eta_A * (phi_uc * u_c');
+    Wi_new = (1 - lambda) * Wi + par.eta_Wi * (phi_uc * phi_uc');
+    
+    nA = norm(A_new,'fro');
+    if nA > par.A_max,  A_new = A_new * (par.A_max/nA);  end
+    nW = norm(Wi_new,'fro');
+    if nW > par.Wi_max, Wi_new = Wi_new * (par.Wi_max/nW); end
+    
+    dmhn_state.A = A_new;
+    dmhn_state.Wi = Wi_new;
+    
+    Au = A_new * phi_uc;
+    scale_wd = par.wd_scale * (1 + log1p(g_nrm));
+    WD_raw = (Au * Au') * scale_wd + diag(T_leak) * par.wd_diag_scale;
+    
+    WD = alpha * alpha_WD_scale * WD_raw;
+    ID = alpha * alpha_ID_scale * Wi_new * phi_uc * par.id_scale;
+
+    Q_eff = G + WD;
+    Q_eff = 0.5*(Q_eff + Q_eff');
+    g_eff = g - ID;
+end
+
+%==========================================================================
+%  DMHN ADAPTIVE NATURAL STOP (MAIN DMHN FUNCTION)
+%==========================================================================
+function [x, hist] = se_dmhn_adaptive_natural_stop(z, meas, Ybus, Yf, mpc, n, nm, Rd, x0, par)
+    Nst  = 2*n - 1;
+    x    = clip_x(x0, n);
+    K    = par.MAX_ITER;
+    hist = init_hist(K);
+    hist.x_final = x;
+
+    tol_g  = par.tol_grad;
+    tol_dx = par.tol_dx;
+
+    x_best = x;
+    J_best = inf;
+    mu     = par.mu0;
+    nu     = 2.0;
+
+    sigma_mean = mean(1 ./ sqrt(max(diag(diag(Rd)), 1e-12)));
+    ds = dmhn_init_general(Nst, par);
+    dt = 0.20;
+    
+    [~, ~, ~, g0, ~] = compute_all_general(x, z, meas, Ybus, Yf, mpc, n, nm, Rd);
+    g0_norm = max(norm(g0), 1e-12);
+    
+    lambda = par.forgetting;
+    
+    WD_prev = zeros(Nst);
+    ID_prev = zeros(Nst, 1);
+    x_prev = x;
+    
+    tol_state = 1e-6;
+    tol_WD = 1e-5;
+    tol_ID = 1e-5;
+    
+    if ~isfield(par, 'alpha_WD_scale')
+        par.alpha_WD_scale = 1.0;
+    end
+    if ~isfield(par, 'alpha_ID_scale')
+        par.alpha_ID_scale = 1.0;
+    end
+
+    for k = 1:K
+        x = clip_x(x, n);
+        [r, H, J_t, g, G] = compute_all_general(x, z, meas, Ybus, Yf, mpc, n, nm, Rd);
+        gn_v = sgi_general(g, G);
+        g_norm = norm(g);
+
+        hist.J(k)  = J_t;
+        hist.gn(k) = gn_v;
+        hist.mu(k) = mu;
+
+        if J_t < J_best
+            J_best = J_t;
+            x_best = x;
+        end
+
+        alpha = min(1.0, g_norm / g0_norm);
+        
+        [Q_eff, g_eff, WD, ID, ds] = dmhn_effective_system_adaptive_scaled(...
+            G, g, r, sigma_mean, x, n, ds, par, alpha, lambda, ...
+            par.alpha_WD_scale, par.alpha_ID_scale);
+        
+        g_nrm = max(g_norm, 1e-8);
+        phi = tanh(g / g_nrm);
+        E_D = 0.5 * phi' * WD * phi;
+        E_I = phi' * ds.Wi * phi;
+        E_total = J_t + real(E_D) + real(E_I);
+        hist.E(k) = E_total;
+        
+        state_change = norm(x - x_prev, inf) / max(norm(x, inf), 1e-12);
+        x_prev = x;
+        WD_change = norm(WD - WD_prev, 'fro') / max(norm(WD_prev, 'fro'), 1e-12);
+        WD_prev = WD;
+        ID_change = norm(ID - ID_prev) / max(norm(ID_prev), 1e-12);
+        ID_prev = ID;
+        hist.step(k) = state_change;
+        
+        if state_change < tol_state && WD_change < tol_WD && ID_change < tol_ID
+            hist = trim_hist(hist, k, 'NATURAL_CONV');
+            hist.conv    = true;
+            hist.x_final = x_best;
+            x = x_best;
+            return;
+        end
+
+        diagQ = max(abs(diag(Q_eff)), 1e-14);
+        Q_lm  = Q_eff + mu * diag(diagQ);
+        Q_lm  = 0.5*(Q_lm + Q_lm');
+
+        [Qp, Ds] = struct_precond_general(Q_lm);
+        dp = solve_svd_general(Qp, Ds .* g_eff, par.svd_tol);
+        d  = Ds .* dp;
+        d(~isfinite(d)) = 0;
+        d  = clip_step_general(d, n, par);
+
+        gTd = g_eff' * d;
+        if ~isfinite(gTd) || gTd >= 0
+            d   = -g_eff;
+            d   = clip_step_general(d, n, par);
+            gTd = g_eff' * d;
+            if gTd >= 0, d = zeros(Nst,1); end
+        end
+
+        alpha_step = 1.0;
+        accepted  = false;
+        rho_k     = -inf;
+        pred_full = -g_eff'*d - 0.5*(d'*Q_lm*d);
+        if ~isfinite(pred_full) || pred_full <= 0
+            pred_full = 1e-4 * max(-gTd, 1e-12);
+        end
+
+        for ls = 1:par.max_ls
+            xt = clip_x(x + alpha_step*dt*d, n);
+            [~,~,Jt,~,~] = compute_all_general(xt, z, meas, Ybus, Yf, mpc, n, nm, Rd);
+            act   = J_t - Jt;
+            rho_k = act / max(alpha_step*dt*pred_full, 1e-18);
+            if isfinite(Jt) && act > 0 && rho_k > par.eta_rej
+                accepted = true;
+                break;
+            end
+            alpha_step = alpha_step * 0.5;
+            if alpha_step < 1e-14, break; end
+        end
+
+        if accepted
+            hist.step(k) = norm(alpha_step*dt*d, inf);
+            x    = clip_x(x + alpha_step*dt*d, n);
+            mu   = mu * max(1/3, 1-(2*rho_k-1)^3);
+            nu   = 2.0;
+        else
+            hist.step(k) = 0;
+            mu = min(par.mu_max, mu*nu);
+            nu = 2*nu;
+        end
+    end
+    
+    x    = x_best;
+    hist = trim_hist(hist, K, 'MAX_ITER');
+    hist.x_final = x;
+
+    [~,~,Jf,gf,Gf] = compute_all_general(x, z, meas, Ybus, Yf, mpc, n, nm, Rd);
+    if Jf <= par.chi2 && sgi_general(gf,Gf) <= tol_g
+        hist.conv   = true;
+        hist.status = 'TRUE_CONV';
+    end
+end
+
+%==========================================================================
+%  DMHN INITIALIZATION
+%==========================================================================
+function ds = dmhn_init_general(Nst, par)
+    ds.A  = eye(Nst) * par.A_init;
+    ds.Wi = eye(Nst) * par.Wi_init;
+end
+
+%==========================================================================
+%  SENSITIVITY FIGURE FUNCTIONS
+%==========================================================================
+
+function fig_sensitivity_heatmaps(results, sysNames)
+    figure('Color','w','Name','Sensitivity_Heatmaps','Position',[50,50,1200,500]);
+    
+    alpha_vals = results.alpha_WD;
+    n_systems = length(results.systems);
+    
+    for si = 1:n_systems
+        subplot(1, n_systems, si);
+        
+        iter_data = results.iterations(:, :, si);
+        iter_data(isnan(iter_data)) = max(iter_data(:));
+        
+        imagesc(alpha_vals, alpha_vals, iter_data);
+        set(gca, 'YDir', 'normal');
+        colorbar;
+        colormap('hot');
+        
+        xlabel('\alpha_{WD} (Manifold Damping)','FontSize',14,'FontWeight','bold');
+        ylabel('\alpha_{ID} (Integral Bias)','FontSize',14,'FontWeight','bold');
+        title(sprintf('Iterations - %s', results.systems{si}),'FontSize',16,'FontWeight','bold');
+        
+        for wi = 1:length(alpha_vals)
+            for ii = 1:length(alpha_vals)
+                val = results.iterations(wi, ii, si);
+                if ~isnan(val) && val > 0
+                    text(wi, ii, sprintf('%.0f', val), ...
+                        'HorizontalAlignment','center','VerticalAlignment','middle', ...
+                        'FontSize',10,'Color','w','FontWeight','bold');
+                end
+            end
+        end
+        
+        set(gca,'FontSize',12,'FontWeight','bold','LineWidth',2);
+    end
+    
+    sgtitle('Hyperparameter Sensitivity: Iterations vs \alpha_{WD} and \alpha_{ID} (MAX_ITER=400)', ...
+        'FontSize',18,'FontWeight','bold');
+    exportgraphics(gcf,'Fig_Sensitivity_Heatmaps.png','Resolution',300);
+    fprintf('  Saved: Fig_Sensitivity_Heatmaps.png\n');
+end
+
+function fig_sensitivity_iterations(results, sysNames)
+    figure('Color','w','Name','Sensitivity_Iterations','Position',[50,50,1200,500]);
+    
+    alpha_vals = results.alpha_WD;
+    n_systems = length(results.systems);
+    colors = {'b-', 'r-', 'g-', 'm-', 'k-'};
+    
+    for si = 1:n_systems
+        subplot(1, n_systems, si);
+        hold on;
+        
+        for ii = 1:length(alpha_vals)
+            iter_data = squeeze(results.iterations(:, ii, si));
+            plot(alpha_vals, iter_data, colors{ii}, 'LineWidth', 2.5, ...
+                'DisplayName', sprintf('\\alpha_{ID}=%.2f', alpha_vals(ii)));
+        end
+        
+        xlabel('\alpha_{WD} (Manifold Damping)','FontSize',14,'FontWeight','bold');
+        ylabel('Iterations to Convergence','FontSize',14,'FontWeight','bold');
+        title(sprintf('%s', results.systems{si}),'FontSize',16,'FontWeight','bold');
+        legend('Location','best','FontSize',10);
+        grid on;
+        set(gca,'FontSize',12,'FontWeight','bold','LineWidth',2);
+        xlim([min(alpha_vals), max(alpha_vals)]);
+        ylim([0, 405]);
+        yline(400, '--k', 'MAX_ITER=400', 'LineWidth', 2);
+    end
+    
+    sgtitle('Convergence Iterations vs \alpha_{WD} for Different \alpha_{ID}', ...
+        'FontSize',18,'FontWeight','bold');
+    exportgraphics(gcf,'Fig_Sensitivity_Iterations.png','Resolution',300);
+    fprintf('  Saved: Fig_Sensitivity_Iterations.png\n');
+end
+
+function fig_sensitivity_runtime(results, sysNames)
+    figure('Color','w','Name','Sensitivity_Runtime','Position',[50,50,1200,500]);
+    
+    alpha_vals = results.alpha_WD;
+    n_systems = length(results.systems);
+    colors = {'b-', 'r-', 'g-', 'm-', 'k-'};
+    
+    for si = 1:n_systems
+        subplot(1, n_systems, si);
+        hold on;
+        
+        for ii = 1:length(alpha_vals)
+            time_data = squeeze(results.time(:, ii, si));
+            plot(alpha_vals, time_data, colors{ii}, 'LineWidth', 2.5, ...
+                'DisplayName', sprintf('\\alpha_{ID}=%.2f', alpha_vals(ii)));
+        end
+        
+        xlabel('\alpha_{WD} (Manifold Damping)','FontSize',14,'FontWeight','bold');
+        ylabel('Runtime (seconds)','FontSize',14,'FontWeight','bold');
+        title(sprintf('%s', results.systems{si}),'FontSize',16,'FontWeight','bold');
+        legend('Location','best','FontSize',10);
+        grid on;
+        set(gca,'FontSize',12,'FontWeight','bold','LineWidth',2);
+        xlim([min(alpha_vals), max(alpha_vals)]);
+    end
+    
+    sgtitle('Runtime vs \alpha_{WD} for Different \alpha_{ID}', ...
+        'FontSize',18,'FontWeight','bold');
+    exportgraphics(gcf,'Fig_Sensitivity_Runtime.png','Resolution',300);
+    fprintf('  Saved: Fig_Sensitivity_Runtime.png\n');
+end
+
+function fig_sensitivity_rmse(results, sysNames)
+    figure('Color','w','Name','Sensitivity_RMSE','Position',[50,50,1200,500]);
+    
+    alpha_vals = results.alpha_WD;
+    n_systems = length(results.systems);
+    colors = {'b-', 'r-', 'g-', 'm-', 'k-'};
+    
+    for si = 1:n_systems
+        subplot(1, n_systems, si);
+        hold on;
+        
+        for ii = 1:length(alpha_vals)
+            rmse_data = squeeze(results.RMSE_V(:, ii, si));
+            plot(alpha_vals, rmse_data, colors{ii}, 'LineWidth', 2.5, ...
+                'DisplayName', sprintf('\\alpha_{ID}=%.2f', alpha_vals(ii)));
+        end
+        
+        xlabel('\alpha_{WD} (Manifold Damping)','FontSize',14,'FontWeight','bold');
+        ylabel('Voltage RMSE (p.u.)','FontSize',14,'FontWeight','bold');
+        title(sprintf('%s', results.systems{si}),'FontSize',16,'FontWeight','bold');
+        legend('Location','best','FontSize',10);
+        grid on;
+        set(gca,'FontSize',12,'FontWeight','bold','LineWidth',2);
+        xlim([min(alpha_vals), max(alpha_vals)]);
+        set(gca, 'YScale', 'log');
+    end
+    
+    sgtitle('RMSE vs \alpha_{WD} for Different \alpha_{ID}', ...
+        'FontSize',18,'FontWeight','bold');
+    exportgraphics(gcf,'Fig_Sensitivity_RMSE.png','Resolution',300);
+    fprintf('  Saved: Fig_Sensitivity_RMSE.png\n');
+end
+
+%==========================================================================
+%  FIGURE FUNCTIONS
+%==========================================================================
+
+function fig_energy_all_systems_DMHN_only(all_hists, sysNames, methodNames, colors, lineStyles)
+    figure('Color','w','Name','Energy_Convergence','Position',[50,50,1500,1000]);
+    [nr, nc] = subplot_grid(length(sysNames));
+    subplot_labels = subplot_label_set(length(sysNames));
+    
+    for si = 1:length(sysNames)
+        ax = subplot(nr,nc,si);
+        hold(ax,'on'); box(ax,'on');
+        
+        mi = 3;
+        h_ = all_hists{si,mi};
+        if ~isempty(h_) && isfield(h_,'E')
+            dat = h_.E(:);
+            dat = dat(~isnan(dat));
+            k = 1:length(dat);
+            if ~isempty(dat)
+                plot(ax, k, dat, lineStyles{mi}, 'Color', colors{mi}, ...
+                    'LineWidth', 4, 'DisplayName', methodNames{mi});
+            end
+        end
+        
+        xlabel(ax,'Iteration','FontSize',14,'FontWeight','bold');
+        ylabel(ax,'Lyapunov Energy \mathcal{E}(x)','FontSize',14,'FontWeight','bold');
+        title(ax, sysNames{si},'FontSize',16,'FontWeight','bold');
+        legend(ax,'Location','best','FontSize',12,'FontWeight','bold');
+        grid(ax,'on');
+        set(ax,'YScale','linear','FontSize',12,'FontWeight','bold','LineWidth',2,'Box','on');
+        
+        text(ax, 0.02, 0.98, subplot_labels{si}, 'Units', 'normalized', ...
+            'FontSize', 18, 'FontWeight', 'bold', 'Color', 'k', ...
+            'VerticalAlignment', 'top', 'HorizontalAlignment', 'left');
+    end
+    sgtitle('Lyapunov Energy Convergence of DMHN (Adaptive Damping)','FontSize',20,'FontWeight','bold');
+    exportgraphics(gcf,'Fig_Energy_Convergence_DMHN_Only.png','Resolution',300);
+    fprintf('  Saved: Fig_Energy_Convergence_DMHN_Only.png\n');
+end
+
+function fig_combined_gradient(all_hists, sysNames, methodNames, colors, lineStyles, tol_grad)
+    figure('Color','w','Name','Gradient_Convergence','Position',[50,50,1500,1000]);
+    [nr, nc] = subplot_grid(length(sysNames));
+    subplot_labels = subplot_label_set(length(sysNames));
+    
+    for si = 1:length(sysNames)
+        ax = subplot(nr,nc,si);
+        hold(ax,'on'); box(ax,'on');
+        for mi = 1:length(methodNames)
+            h_ = all_hists{si,mi};
+            if isempty(h_) || ~isfield(h_,'gn'), continue; end
+            dat = abs(h_.gn(:));
+            dat = dat(~isnan(dat));
+            k = 1:length(dat);
+            if ~isempty(dat)
+                semilogy(ax, k, max(dat, 1e-12), lineStyles{mi}, 'Color', colors{mi}, ...
+                    'LineWidth', 4, 'DisplayName', methodNames{mi});
+            end
+        end
+        yline(ax, tol_grad,'--r','LineWidth',3,'DisplayName','Tolerance');
+        xlabel(ax,'Iteration','FontSize',14,'FontWeight','bold');
+        ylabel(ax,'Gradient norm ||g||_s (log scale)','FontSize',14,'FontWeight','bold');
+        title(ax, sysNames{si},'FontSize',16,'FontWeight','bold');
+        legend(ax,'Location','best','FontSize',12,'FontWeight','bold');
+        grid(ax,'on');
+        set(ax,'YScale','log','FontSize',12,'FontWeight','bold','LineWidth',2,'Box','on');
+        
+        text(ax, 0.02, 0.98, subplot_labels{si}, 'Units', 'normalized', ...
+            'FontSize', 18, 'FontWeight', 'bold', 'Color', 'k', ...
+            'VerticalAlignment', 'top', 'HorizontalAlignment', 'left');
+    end
+    sgtitle('Gradient Norm Convergence - All Methods (Log Scale)','FontSize',20,'FontWeight','bold');
+    exportgraphics(gcf,'Fig_Gradient_Convergence_Combined.png','Resolution',300);
+    fprintf('  Saved: Fig_Gradient_Convergence_Combined.png\n');
+end
+
+function fig_combined_step(all_hists, sysNames, methodNames, colors, lineStyles, tol_dx)
+    figure('Color','w','Name','Step_Convergence','Position',[50,50,1500,1000]);
+    [nr, nc] = subplot_grid(length(sysNames));
+    subplot_labels = subplot_label_set(length(sysNames));
+    
+    for si = 1:length(sysNames)
+        ax = subplot(nr,nc,si);
+        hold(ax,'on'); box(ax,'on');
+        for mi = 1:length(methodNames)
+            h_ = all_hists{si,mi};
+            if isempty(h_) || ~isfield(h_,'step'), continue; end
+            dat = h_.step(:);
+            dat = dat(~isnan(dat));
+            k = 1:length(dat);
+            if ~isempty(dat)
+                semilogy(ax, k, abs(dat), lineStyles{mi}, 'Color', colors{mi}, ...
+                    'LineWidth', 4, 'DisplayName', methodNames{mi});
+            end
+        end
+        yline(ax, tol_dx,'--r','LineWidth',3,'DisplayName','Tolerance');
+        xlabel(ax,'Iteration','FontSize',14,'FontWeight','bold');
+        ylabel(ax,'Step size ||dx||_\infty','FontSize',14,'FontWeight','bold');
+        title(ax, sysNames{si},'FontSize',16,'FontWeight','bold');
+        legend(ax,'Location','best','FontSize',12,'FontWeight','bold');
+        grid(ax,'on');
+        set(ax,'YScale','log','FontSize',12,'FontWeight','bold','LineWidth',2,'Box','on');
+        
+        text(ax, 0.02, 0.98, subplot_labels{si}, 'Units', 'normalized', ...
+            'FontSize', 18, 'FontWeight', 'bold', 'Color', 'k', ...
+            'VerticalAlignment', 'top', 'HorizontalAlignment', 'left');
+    end
+    sgtitle('Step Size Convergence - All Methods','FontSize',20,'FontWeight','bold');
+    exportgraphics(gcf,'Fig_Step_Convergence_Combined.png','Resolution',300);
+    fprintf('  Saved: Fig_Step_Convergence_Combined.png\n');
+end
+
+function fig_rmse_bars(all_rmseV, all_rmseA, sysNames, methodNames)
+    figure('Color','w','Name','RMSE_Bars','Position',[50,50,1500,800]);
+    x = 1:length(sysNames);
+    width = 0.25;
+    colors = {[0 0 0],[0 0.45 0.74],[0.85 0.33 0.10]};
+
+    ax1 = subplot(1,2,1);
+    hold(ax1,'on'); box(ax1,'on');
+    for mi = 1:length(methodNames)
+        bar(x+(mi-2)*width, all_rmseV(:,mi), width, 'FaceColor', colors{mi}, ...
+            'EdgeColor','k','LineWidth',2,'DisplayName',methodNames{mi});
+    end
+    xlabel(ax1,'System','FontSize',14,'FontWeight','bold');
+    ylabel(ax1,'Voltage RMSE (p.u.)','FontSize',14,'FontWeight','bold');
+    title(ax1,'Voltage Magnitude RMSE','FontSize',16,'FontWeight','bold');
+    set(ax1,'XTick',x,'XTickLabel',sysNames,'FontSize',12,'FontWeight','bold','LineWidth',2);
+    legend(ax1,'Location','northwest','FontSize',12,'FontWeight','bold');
+    grid(ax1,'on');
+
+    ax2 = subplot(1,2,2);
+    hold(ax2,'on'); box(ax2,'on');
+    for mi = 1:length(methodNames)
+        bar(x+(mi-2)*width, all_rmseA(:,mi)*180/pi, width, 'FaceColor', colors{mi}, ...
+            'EdgeColor','k','LineWidth',2,'DisplayName',methodNames{mi});
+    end
+    xlabel(ax2,'System','FontSize',14,'FontWeight','bold');
+    ylabel(ax2,'Angle RMSE (deg)','FontSize',14,'FontWeight','bold');
+    title(ax2,'Phase Angle RMSE','FontSize',16,'FontWeight','bold');
+    set(ax2,'XTick',x,'XTickLabel',sysNames,'FontSize',12,'FontWeight','bold','LineWidth',2);
+    legend(ax2,'Location','northwest','FontSize',12,'FontWeight','bold');
+    grid(ax2,'on');
+
+    sgtitle('RMSE Comparison - All Methods','FontSize',20,'FontWeight','bold');
+    exportgraphics(gcf,'Fig_RMSE_Bars.png','Resolution',300);
+    fprintf('  Saved: Fig_RMSE_Bars.png\n');
+end
+
+function fig_bus_errors_voltage(all_x_final, true_Vm_all, sysNames, methodNames, colors, markers)
+    figure('Color','w','Name','Bus_Errors_Voltage','Position',[50,50,1500,1000]);
+    [nr, nc] = subplot_grid(length(sysNames));
+    subplot_labels = subplot_label_set(length(sysNames));
+    
+    for si = 1:length(sysNames)
+        ax = subplot(nr,nc,si);
+        hold(ax,'on'); box(ax,'on');
+        n = length(true_Vm_all{si});
+        trueVm = true_Vm_all{si};
+        
+        for mi = 1:length(methodNames)
+            x = all_x_final{si,mi};
+            if isempty(x), continue; end
+            Vm_est = x(n:end);
+            err = abs(Vm_est - trueVm) * 1000;
+            plot(ax, 1:n, err, '-', 'Color', colors{mi}, 'LineWidth', 3.5, ...
+                'Marker', markers{mi}, 'MarkerSize', 12, 'MarkerEdgeColor', colors{mi}, ...
+                'MarkerFaceColor', colors{mi}, 'DisplayName', methodNames{mi});
+        end
+        xlabel(ax,'Bus Number','FontSize',14,'FontWeight','bold');
+        ylabel(ax,'|Voltage Error| (m-p.u.)','FontSize',14,'FontWeight','bold');
+        title(ax,sysNames{si},'FontSize',16,'FontWeight','bold');
+        legend(ax,'Location','best','FontSize',12,'FontWeight','bold');
+        grid(ax,'on');
+        set(ax,'FontSize',12,'FontWeight','bold','LineWidth',2,'Box','on');
+        
+        text(ax, 0.02, 0.98, subplot_labels{si}, 'Units', 'normalized', ...
+            'FontSize', 18, 'FontWeight', 'bold', 'Color', 'k', ...
+            'VerticalAlignment', 'top', 'HorizontalAlignment', 'left');
+    end
+    sgtitle('Bus-Level Voltage Errors - All Methods','FontSize',20,'FontWeight','bold');
+    exportgraphics(gcf,'Fig_Bus_Errors_Voltage.png','Resolution',300);
+    fprintf('  Saved: Fig_Bus_Errors_Voltage.png\n');
+end
+
+function fig_bus_errors_angle(all_x_final, true_Th_all, sysNames, methodNames, colors, markers)
+    figure('Color','w','Name','Bus_Errors_Angle','Position',[50,50,1500,1000]);
+    [nr, nc] = subplot_grid(length(sysNames));
+    subplot_labels = subplot_label_set(length(sysNames));
+    
+    for si = 1:length(sysNames)
+        ax = subplot(nr,nc,si);
+        hold(ax,'on'); box(ax,'on');
+        n = length(true_Th_all{si});
+        trueTh = true_Th_all{si};
+        
+        for mi = 1:length(methodNames)
+            x = all_x_final{si,mi};
+            if isempty(x), continue; end
+            th_est = [0; x(1:n-1)];
+            err = abs(th_est - trueTh)*180/pi;
+            plot(ax, 1:n, err, '-', 'Color', colors{mi}, 'LineWidth', 3.5, ...
+                'Marker', markers{mi}, 'MarkerSize', 12, 'MarkerEdgeColor', colors{mi}, ...
+                'MarkerFaceColor', colors{mi}, 'DisplayName', methodNames{mi});
+        end
+        xlabel(ax,'Bus Number','FontSize',14,'FontWeight','bold');
+        ylabel(ax,'|Angle Error| (deg)','FontSize',14,'FontWeight','bold');
+        title(ax,sysNames{si},'FontSize',16,'FontWeight','bold');
+        legend(ax,'Location','best','FontSize',12,'FontWeight','bold');
+        grid(ax,'on');
+        set(ax,'FontSize',12,'FontWeight','bold','LineWidth',2,'Box','on');
+        
+        text(ax, 0.02, 0.98, subplot_labels{si}, 'Units', 'normalized', ...
+            'FontSize', 18, 'FontWeight', 'bold', 'Color', 'k', ...
+            'VerticalAlignment', 'top', 'HorizontalAlignment', 'left');
+    end
+    sgtitle('Bus-Level Angle Errors - All Methods','FontSize',20,'FontWeight','bold');
+    exportgraphics(gcf,'Fig_Bus_Errors_Angle.png','Resolution',300);
+    fprintf('  Saved: Fig_Bus_Errors_Angle.png\n');
+end
+
+%==========================================================================
+%  HELPER FUNCTIONS
+%==========================================================================
+function [nr, nc] = subplot_grid(nSys)
+    nc = ceil(sqrt(nSys));
+    nr = ceil(nSys / nc);
+end
+
+function labs = subplot_label_set(nSys)
+    letters = 'a':'z';
+    labs = cell(1, nSys);
+    for i = 1:nSys
+        labs{i} = sprintf('(%s)', letters(i));
+    end
+end
+
+%==========================================================================
+%  CORE WLS METHODS
+%==========================================================================
+function [x, hist] = se_wls_correct(z, meas, Ybus, Yf, mpc, n, nm, Rd, x0, par)
+    x    = clip_x(x0, n);
+    hist = init_hist(par.MAX_ITER);
+    hist.x_final = x;
+    kappa = par.kappa;
+
+    for k = 1:par.MAX_ITER
+        [~,~,J,g,G] = compute_all_general(x, z, meas, Ybus, Yf, mpc, n, nm, Rd);
+
+        hist.J(k)  = J;
+        hist.gn(k) = norm(g, inf);
+
+        if rcond(G) < 1e-14
+            dx = g * kappa;
+        else
+            dx = -(G \ g);
+        end
+        dx(~isfinite(dx)) = sign(dx(~isfinite(dx)) + eps) * kappa;
+
+        hist.step(k) = norm(dx, inf);
+        x = clip_x(x + dx, n);
+
+        if hist.gn(k) <= par.tol && hist.step(k) <= par.tol_dx
+            hist = trim_hist(hist, k, 'CONVERGED');
+            hist.conv  = true;
+            hist.x_final = x;
+            return;
+        end
+    end
+
+    hist = trim_hist(hist, par.MAX_ITER, 'MAX_ITER');
+    hist.x_final = x;
+end
+
+function [x, hist] = se_wls_lm_correct(z, meas, Ybus, Yf, mpc, n, nm, Rd, x0, par)
+    x    = clip_x(x0, n);
+    hist = init_hist(par.MAX_ITER);
+    hist.x_final = x;
+    Nst   = 2*n - 1;
+    kappa = par.kappa;
+
+    for k = 1:par.MAX_ITER
+        [~,~,J,g,G] = compute_all_general(x, z, meas, Ybus, Yf, mpc, n, nm, Rd);
+
+        hist.J(k)  = J;
+        hist.gn(k) = norm(g, inf);
+
+        if kappa > 1e3
+            lambda = 1e-12 * max(abs(diag(G)));
+        else
+            lambda = max(1e-6, 1e-4 * trace(G) / Nst);
+        end
+
+        A  = G + lambda * eye(size(G));
+        dx = -(A \ g);
+        if any(~isfinite(dx))
+            dx = g * kappa;
+        end
+
+        hist.step(k) = norm(dx, inf);
+        x = clip_x(x + dx, n);
+
+        if hist.gn(k) <= par.tol && hist.step(k) <= par.tol_dx
+            hist = trim_hist(hist, k, 'CONVERGED');
+            hist.conv    = true;
+            hist.x_final = x;
+            return;
+        end
+    end
+
+    hist = trim_hist(hist, par.MAX_ITER, 'MAX_ITER');
+    hist.x_final = x;
+end
+
+%==========================================================================
+%  BUILD FROM MATPOWER
+%==========================================================================
+function mpc = build_from_matpower(case_name)
+    raw = loadcase(case_name);
+    mpopt = mpoption('verbose', 0, 'out.all', 0, ...
+                     'pf.alg', 'NR', 'pf.tol', 1e-10, ...
+                     'pf.nr.max_it', 50, 'pf.enforce_q_lims', 0);
+    [solved, success] = runpf(raw, mpopt);
+    
+    if ~(logical(success) && isfield(solved, 'success') && solved.success)
+        error('MATPOWER power flow failed for %s', case_name);
+    end
+
+    solved = ext2int(solved);
+    n = size(solved.bus, 1);
+    
+    ref_bus = find(solved.bus(:,2) == 3, 1, 'first');
+    if isempty(ref_bus), ref_bus = 1; end
+    
+    order = [ref_bus; setdiff((1:n)', ref_bus, 'stable')];
+    old_to_new = zeros(n,1);
+    old_to_new(order) = (1:n)';
+    
+    solved.bus = solved.bus(order,:);
+    solved.bus(:,1) = (1:n)';
+    if isfield(solved, 'gen')
+        solved.gen(:,1) = old_to_new(solved.gen(:,1));
+    end
+    solved.branch(:,1) = old_to_new(solved.branch(:,1));
+    solved.branch(:,2) = old_to_new(solved.branch(:,2));
+    solved.branch = solved.branch(solved.branch(:,11) ~= 0, :);
+
+    Pg = zeros(n,1); Qg = zeros(n,1);
+    if isfield(solved, 'gen')
+        online = find(solved.gen(:,8) > 0);
+        for k = online(:)'
+            b = solved.gen(k,1);
+            Pg(b) = Pg(b) + solved.gen(k,2) / solved.baseMVA;
+            Qg(b) = Qg(b) + solved.gen(k,3) / solved.baseMVA;
+        end
+    end
+
+    internal_type = 3 * ones(n,1);
+    internal_type(solved.bus(:,2) == 2) = 2;
+    internal_type(solved.bus(:,2) == 3) = 1;
+
+    mpc.bus = [(1:n)', internal_type, solved.bus(:,3)/solved.baseMVA, ...
+               solved.bus(:,4)/solved.baseMVA, Pg, Qg, solved.bus(:,8)];
+    
+    tap = solved.branch(:,9); tap(tap == 0) = 1;
+    mpc.branch = [solved.branch(:,1), solved.branch(:,2), ...
+                  solved.branch(:,3), solved.branch(:,4), ...
+                  solved.branch(:,5), tap];
+    mpc.n = n;
+end
+
+%==========================================================================
+%  IEEE 57-BUS SYSTEM BUILDER (FALLBACK)
+%==========================================================================
+function mpc = build_ieee57_mpc()
+    busdat = [
+        1, 1, 0.55, 0.17, 0, 0, 1.000;
+        2, 2, 0.03, 0.88, 0, 0, 1.010;
+        3, 2, 0.41, 0.21, 0, 0, 0.985;
+        4, 3, 0, 0, 0, 0, 1.000;
+        5, 3, 0.13, 0.04, 0, 0, 1.000;
+        6, 3, 0, 0, 0, 0, 1.000;
+        7, 3, 0, 0, 0, 0, 1.000;
+        8, 2, 1.50, 0.22, 0, 0, 1.005;
+        9, 3, 1.21, 0.57, 0, 0, 1.000;
+        10, 3, 0.06, 0.02, 0, 0, 1.000;
+        11, 3, 0, 0, 0, 0, 1.000;
+        12, 2, 0, 0, 0, 0, 1.015;
+        13, 3, 0.18, 0.02, 0, 0, 1.000;
+        14, 3, 0, 0, 0, 0, 1.000;
+        15, 3, 0.22, 0.05, 0, 0, 1.000;
+        16, 3, 0.43, 0.03, 0, 0, 1.000;
+        17, 3, 0, 0, 0, 0, 1.000;
+        18, 3, 0.12, 0.01, 0, 0, 1.000;
+        19, 3, 0, 0, 0, 0, 1.000;
+        20, 3, 0, 0, 0, 0, 1.000;
+        21, 3, 0, 0, 0, 0, 1.000;
+        22, 3, 0, 0, 0, 0, 1.000;
+        23, 3, 0, 0, 0, 0, 1.000;
+        24, 3, 0, 0, 0, 0, 1.000;
+        25, 3, 0, 0, 0, 0, 1.000;
+        26, 3, 0, 0, 0, 0, 1.000;
+        27, 3, 0, 0, 0, 0, 1.000;
+        28, 3, 0, 0, 0, 0, 1.000;
+        29, 3, 0, 0, 0, 0, 1.000;
+        30, 3, 0, 0, 0, 0, 1.000;
+        31, 3, 0, 0, 0, 0, 1.000;
+        32, 3, 0, 0, 0, 0, 1.000;
+        33, 3, 0, 0, 0, 0, 1.000;
+        34, 3, 0, 0, 0, 0, 1.000;
+        35, 3, 0, 0, 0, 0, 1.000;
+        36, 3, 0, 0, 0, 0, 1.000;
+        37, 3, 0, 0, 0, 0, 1.000;
+        38, 3, 0, 0, 0, 0, 1.000;
+        39, 3, 0, 0, 0, 0, 1.000;
+        40, 3, 0, 0, 0, 0, 1.000;
+        41, 3, 0, 0, 0, 0, 1.000;
+        42, 3, 0, 0, 0, 0, 1.000;
+        43, 3, 0, 0, 0, 0, 1.000;
+        44, 3, 0, 0, 0, 0, 1.000;
+        45, 3, 0, 0, 0, 0, 1.000;
+        46, 3, 0, 0, 0, 0, 1.000;
+        47, 3, 0, 0, 0, 0, 1.000;
+        48, 3, 0, 0, 0, 0, 1.000;
+        49, 3, 0, 0, 0, 0, 1.000;
+        50, 3, 0, 0, 0, 0, 1.000;
+        51, 3, 0, 0, 0, 0, 1.000;
+        52, 3, 0, 0, 0, 0, 1.000;
+        53, 3, 0, 0, 0, 0, 1.000;
+        54, 3, 0, 0, 0, 0, 1.000;
+        55, 3, 0, 0, 0, 0, 1.000;
+        56, 3, 0, 0, 0, 0, 1.000;
+        57, 3, 0, 0, 0, 0, 1.000
+    ];
+    linedat = [
+        1,2,0.0083,0.0280,0.1290,1; 2,3,0.0298,0.0850,0.0818,1;
+        3,4,0.0112,0.0366,0.0380,1; 4,5,0.0625,0.1320,0.0258,1;
+        5,6,0.0430,0.1480,0.0348,1; 6,7,0.0200,0.1020,0.0276,1;
+        7,8,0.0165,0.0890,0.0368,1; 8,9,0.0620,0.2170,0.0328,1;
+        9,10,0.0650,0.2200,0.0330,1; 10,11,0.0240,0.1060,0.0292,1;
+        11,12,0.0100,0.0460,0.0230,1; 12,13,0.0220,0.1400,0.0400,1;
+        13,14,0.0320,0.1800,0.0400,1; 14,15,0.0200,0.1100,0.0300,1;
+        15,16,0.0740,0.3100,0.0450,1; 16,17,0.0090,0.0440,0.0220,1;
+        17,18,0.0400,0.2000,0.0400,1; 18,19,0.0300,0.1500,0.0300,1;
+        19,20,0.0700,0.3000,0.0400,1; 20,21,0.0600,0.2500,0.0350,1;
+        21,22,0.0300,0.1200,0.0250,1; 22,23,0.0200,0.0900,0.0200,1;
+        23,24,0.0800,0.3200,0.0400,1; 24,25,0.0200,0.1000,0.0250,1;
+        25,26,0.0500,0.2000,0.0300,1; 26,27,0.0400,0.1800,0.0300,1;
+        27,28,0.0600,0.2500,0.0350,1; 28,29,0.0300,0.1200,0.0250,1;
+        29,30,0.0100,0.0500,0.0150,1; 30,31,0.0500,0.2000,0.0300,1;
+        31,32,0.0200,0.0900,0.0200,1; 32,33,0.0300,0.1300,0.0250,1;
+        33,34,0.0500,0.2000,0.0300,1; 34,35,0.0200,0.1000,0.0250,1;
+        35,36,0.0600,0.2500,0.0350,1; 36,37,0.0300,0.1400,0.0250,1;
+        37,38,0.0800,0.3200,0.0400,1; 38,39,0.0300,0.1300,0.0250,1;
+        39,40,0.0700,0.2800,0.0350,1; 40,41,0.0100,0.0500,0.0150,1;
+        41,42,0.0800,0.3200,0.0400,1; 42,43,0.0400,0.1600,0.0250,1;
+        43,44,0.0200,0.1000,0.0200,1; 44,45,0.0500,0.2000,0.0300,1;
+        45,46,0.0600,0.2500,0.0350,1; 46,47,0.0100,0.0500,0.0150,1;
+        47,48,0.0700,0.2800,0.0350,1; 48,49,0.0300,0.1400,0.0250,1;
+        49,50,0.0800,0.3200,0.0400,1; 50,51,0.0200,0.1000,0.0200,1;
+        51,52,0.0500,0.2000,0.0300,1; 52,53,0.0400,0.1600,0.0250,1;
+        53,54,0.0100,0.0500,0.0150,1; 54,55,0.0600,0.2500,0.0350,1;
+        55,56,0.0300,0.1400,0.0250,1; 56,57,0.0200,0.1000,0.0200,1
+    ];
+    n = size(busdat,1);
+    nb = size(linedat,1);
+    mpc.bus = zeros(n,7);
+    for i = 1:n
+        mpc.bus(i,:) = [busdat(i,1), busdat(i,2), busdat(i,3), busdat(i,4), ...
+                        busdat(i,5), busdat(i,6), busdat(i,7)];
+    end
+    mpc.branch = zeros(nb,6);
+    for k = 1:nb
+        tap = linedat(k,6); if tap == 0, tap = 1; end
+        mpc.branch(k,:) = [linedat(k,1), linedat(k,2), linedat(k,3), ...
+                           linedat(k,4), linedat(k,5), tap];
+    end
+    mpc.n = n;
+end
+
+%==========================================================================
+%  GENERAL COMPUTATION FUNCTIONS
+%==========================================================================
+function [r, H, J, g, G] = compute_all_general(x, z, meas, Ybus, Yf, mpc, n, nm, Rd)
+    x  = clip_x(x, n);
+    hx = h_meas_general(x, meas, Ybus, Yf, mpc, n);
+    r  = hx - z;
+    r(~isfinite(r)) = 0;
+    H  = jac_H_general(x, meas, Ybus, Yf, mpc, n, nm);
+    H(~isfinite(H)) = 0;
+    G  = H' * bsxfun(@times, H, Rd);
+    G  = 0.5*(G + G');
+    g  = H' * (Rd .* r);
+    J  = 0.5*(r' * (Rd .* r));
+end
+
+function hx = h_meas_general(x, meas, Ybus, Yf, mpc, n)
+    theta = [0; x(1:n-1)];
+    Vmag  = max(0.01, x(n:end));
+    V     = Vmag .* exp(1i*theta);
+    Sinj  = V .* conj(Ybus*V);
+    If    = Yf*V;
+    fr    = max(1, min(n, round(mpc.branch(:,1))));
+    Sf    = V(fr) .* conj(If);
+    hx    = [real(Sinj); imag(Sinj); Vmag; real(Sf); imag(Sf)];
+    if strcmpi(meas.mode,'HYBRID')
+        pb = meas.pmu_buses(:);
+        hx = [hx; Vmag(pb).*cos(theta(pb)); Vmag(pb).*sin(theta(pb))];
+    end
+    hx(~isfinite(hx)) = 0;
+end
+
+function H = jac_H_general(x, meas, Ybus, Yf, mpc, n, nm)
+    Nst   = numel(x);
+    theta = [0; x(1:n-1)];
+    Vmag  = max(0.01, x(n:end));
+    V     = Vmag .* exp(1i*theta);
+    nb_   = size(mpc.branch,1);
+    fr    = max(1, min(n, round(mpc.branch(:,1))));
+    H     = zeros(nm, Nst);
+    Ibus  = Ybus*V;
+    Vnorm = V ./ max(abs(V),1e-9);
+    dSth  = 1i*diag(V)*conj(diag(Ibus) - Ybus*diag(V));
+    dSVm  = diag(V)*conj(Ybus*diag(Vnorm)) + diag(Ibus)*conj(diag(Vnorm));
+    H(1:n,       1:n-1)   = real(dSth(:,2:n));
+    H(1:n,       n:2*n-1) = real(dSVm);
+    H(n+1:2*n,   1:n-1)   = imag(dSth(:,2:n));
+    H(n+1:2*n,   n:2*n-1) = imag(dSVm);
+    H(2*n+1:3*n, n:2*n-1) = eye(n);
+    If  = Yf*V;
+    Vf  = V(fr);
+    Sf  = Vf .* conj(If);
+    Vfn = Vf ./ max(abs(Vf),1e-9);
+    Cf  = sparse((1:nb_)',fr,1,nb_,n);
+    dSf_Va = 1j*(diag(Sf)*Cf - diag(Vf)*conj(Yf*diag(V)));
+    dSf_Vm = diag(conj(If).*Vfn)*Cf + diag(Vf)*conj(Yf*diag(Vnorm));
+    rP_s = 3*n+1;       rP_e = min(3*n+nb_,nm);
+    rQ_s = 3*n+nb_+1;   rQ_e = min(3*n+2*nb_,nm);
+    nb_P = rP_e-rP_s+1; nb_Q = rQ_e-rQ_s+1;
+    if nb_P > 0
+        H(rP_s:rP_e,1:n-1)   = real(full(dSf_Va(1:nb_P,2:n)));
+        H(rP_s:rP_e,n:2*n-1) = real(full(dSf_Vm(1:nb_P,:)));
+    end
+    if nb_Q > 0
+        H(rQ_s:rQ_e,1:n-1)   = imag(full(dSf_Va(1:nb_Q,2:n)));
+        H(rQ_s:rQ_e,n:2*n-1) = imag(full(dSf_Vm(1:nb_Q,:)));
+    end
+    if strcmpi(meas.mode,'HYBRID')
+        pb = meas.pmu_buses(:);
+        np = numel(pb);
+        for k = 1:np
+            bi  = pb(k);
+            thi = bi-1;
+            Vc  = n+bi-1;
+            rr  = 3*n+2*nb_+k;
+            ri  = 3*n+2*nb_+np+k;
+            if rr > nm || ri > nm, continue; end
+            if thi >= 1 && thi <= n-1
+                H(rr,thi) = -Vmag(bi)*sin(theta(bi));
+                H(ri,thi) =  Vmag(bi)*cos(theta(bi));
+            end
+            H(rr,Vc) = cos(theta(bi));
+            H(ri,Vc) = sin(theta(bi));
+        end
+    end
+    H(~isfinite(H)) = 0;
+end
+
+function [z, meas] = build_meas_general(mpc, Ybus, Yf, theta, Vmag, n, nb, pb, mode, ~)
+    V    = Vmag .* exp(1i*theta);
+    Sinj = V .* conj(Ybus*V);
+    If   = Yf*V;
+    fr   = max(1, min(n, round(mpc.branch(:,1))));
+    Sf   = V(fr) .* conj(If);
+    zs   = [real(Sinj); imag(Sinj); Vmag; real(Sf); imag(Sf)];
+
+    sig_s = [0.02*ones(n,1); 0.025*ones(n,1); 0.006*ones(n,1); ...
+             0.02*ones(nb,1); 0.025*ones(nb,1)];
+
+    if strcmpi(mode,'HYBRID')
+        np    = numel(pb);
+        zp    = [Vmag(pb).*cos(theta(pb)); Vmag(pb).*sin(theta(pb))];
+        z     = [zs; zp];
+        sigma = [sig_s; 0.001*ones(2*np,1)];
+    else
+        z     = zs;
+        sigma = sig_s;
+        pb    = [];
+    end
+
+    meas.mode      = upper(mode);
+    meas.n         = n;
+    meas.nb        = nb;
+    meas.pmu_buses = pb;
+    meas.sigma     = sigma;
+end
+
+function val = sgi_general(g, G)
+    g(~isfinite(g)) = 0;
+    if isempty(G) || size(G,1) ~= numel(g)
+        val = norm(g,inf); return;
+    end
+    d    = abs(diag(G));
+    d(~isfinite(d)) = 0;
+    pos  = d(d > 0);
+    if isempty(pos), sf = 1; else sf = 1e-12*max(pos); end
+    d    = max(d, sf);
+    gs   = g ./ sqrt(d);
+    gs(~isfinite(gs)) = 0;
+    val  = norm(gs, inf);
+end
+
+function [Qp, Ds] = struct_precond_general(Q)
+    d = abs(diag(Q));
+    d = max(d, 1e-12*(max(d(d>0))+eps));
+    Ds = 1 ./ sqrt(d);
+    Ds(~isfinite(Ds)) = 1;
+    Qp = bsxfun(@times, bsxfun(@times,Q,Ds), Ds');
+    Qp = 0.5*(Qp+Qp');
+end
+
+function d = solve_svd_general(Q, g, tol)
+    Q(~isfinite(Q)) = 0;
+    g(~isfinite(g)) = 0;
+    Q  = 0.5*(Q+Q');
+    rc = rcond(Q);
+    if ~isfinite(rc), rc = 0; end
+    if rc < tol
+        [U,S,V] = svd(Q,'econ');
+        sv  = diag(S);
+        if isempty(sv) || max(sv) <= 0
+            d = -g; return;
+        end
+        dmp = 1e-6*max(sv);
+        d   = -V*((sv./(sv.^2+dmp^2)).*(U'*g));
+    else
+        try
+            [L,f] = chol(Q,'lower');
+            if f == 0
+                d = -(L'\(L\g));
+            else
+                d = -(Q\g);
+            end
+        catch
+            d = -(Q\g);
+        end
+    end
+    if any(~isfinite(d)), d = -g; end
+end
+
+function d = clip_step_general(d, n, par)
+    d(~isfinite(d)) = 0;
+    na = norm(d(1:min(n-1,end)), inf);
+    if na > par.max_angle_step && na > 0
+        d(1:n-1) = d(1:n-1) * (par.max_angle_step/na);
+    end
+    if numel(d) >= 2*n-1
+        nv = norm(d(n:end), inf);
+        if nv > par.max_volt_step && nv > 0
+            d(n:end) = d(n:end) * (par.max_volt_step/nv);
+        end
+    end
+end
+
+function x = clip_x(x, n)
+    x(~isfinite(x)) = 0;
+    x(1:n-1) = max(-pi/2+1e-8, min(pi/2-1e-8, x(1:n-1)));
+    x(n:end) = max(0.5+1e-8, min(1.5-1e-8, x(n:end)));
+end
+
+function [rmseV, rmseA] = rmse_state_full(x, Vtrue, Ttrue, n)
+    if isempty(x) || any(~isfinite(x))
+        rmseV = inf; rmseA = inf; return;
+    end
+    th    = [0; x(1:n-1)];
+    Vm    = x(n:end);
+    rmseV = sqrt(mean((Vm(:)-Vtrue(:)).^2));
+    rmseA = sqrt(mean((th(:)-Ttrue(:)).^2));
+end
+
+function hist = init_hist(K)
+    hist.J      = nan(K,1);
+    hist.E      = nan(K,1);
+    hist.gn     = nan(K,1);
+    hist.step   = nan(K,1);
+    hist.mu     = nan(K,1);
+    hist.iters  = K;
+    hist.conv   = false;
+    hist.status = 'MAX_ITER';
+    hist.x_final = [];
+end
+
+function hist = trim_hist(hist, k, status)
+    Kf          = max(2,k);
+    hist.J      = hist.J(1:Kf);
+    hist.E      = hist.E(1:Kf);
+    hist.gn     = hist.gn(1:Kf);
+    hist.step   = hist.step(1:Kf);
+    hist.mu     = hist.mu(1:Kf);
+    hist.iters  = k;
+    hist.status = status;
+end
+
+function hist = audit_general(hist, x, z, meas, Ybus, Yf, mpc, n, nm, Rd, ...
+        rmseV, rmseA, tol_g, tol_dx, rmse_lim, name)
+    [~,~,Jf,gf,Gf] = compute_all_general(x, z, meas, Ybus, Yf, mpc, n, nm, Rd);
+    gn_f = sgi_general(gf, Gf);
+    d    = max(abs(diag(Gf)), 1e-14);
+    dxf  = norm(gf ./ d, inf);
+    hist.J_final  = Jf;
+    hist.gn_final = gn_f;
+    hist.dx_final = dxf;
+    hist.rmseV    = rmseV;
+    hist.rmseA    = rmseA;
+
+    g_ok    = isfinite(gn_f) && gn_f <= tol_g;
+    dx_ok   = isfinite(dxf) && dxf  <= tol_dx;
+    last_step = NaN;
+    if isfield(hist,'step') && ~isempty(hist.step)
+        v = hist.step(isfinite(hist.step));
+        if ~isempty(v), last_step = v(end); end
+    end
+    step_ok = isfinite(last_step) && last_step <= tol_dx;
+
+    if ~isfinite(rmseV) || rmseV > rmse_lim
+        hist.conv   = false;
+        hist.status = 'FALSE_CONV_HIGH_RMSE';
+    elseif ~isfinite(Jf) || ~isfinite(gn_f)
+        hist.conv   = false;
+        hist.status = 'DIVERGED';
+    elseif (g_ok || dx_ok || step_ok)
+        hist.conv   = true;
+        hist.status = 'TRUE_CONV';
+    elseif ~isfinite(Jf)
+        hist.conv   = false;
+        hist.status = 'NOT_CONVERGED';
+    else
+        hist.conv   = false;
+        hist.status = 'NOT_CONVERGED';
+    end
+    hist.audit_method = name;
+end
+
+function [Ybus, Yf] = build_Ybus_general(mpc, n)
+    nb_  = size(mpc.branch,1);
+    Ybus = sparse(n,n);
+    Yf   = zeros(nb_,n);
+    for k = 1:nb_
+        f   = max(1, min(n, round(mpc.branch(k,1))));
+        t   = max(1, min(n, round(mpc.branch(k,2))));
+        r   = mpc.branch(k,3);
+        x   = mpc.branch(k,4);
+        bsh = mpc.branch(k,5);
+        tap = mpc.branch(k,6);
+
+        den = r^2 + x^2;
+        if den < 1e-12
+            ys = 1e6 * (1 - 1i*0);
+        else
+            ys = (r - 1i*x) / den;
+        end
+
+        yff = (ys + 1i*bsh/2) / (tap^2);
+        yft = -ys / tap;
+        ytf = -ys / tap;
+        ytt =  ys + 1i*bsh/2;
+
+        Ybus(f,f) = Ybus(f,f) + yff;
+        Ybus(f,t) = Ybus(f,t) + yft;
+        Ybus(t,f) = Ybus(t,f) + ytf;
+        Ybus(t,t) = Ybus(t,t) + ytt;
+        Yf(k,f) = yff;
+        Yf(k,t) = yft;
+    end
+    Yf = sparse(Yf);
+end
+
+function [theta, Vmag, pf_ok] = run_pf_robust(mpc, Ybus, n, sl)
+    bt   = mpc.bus(:,2);
+    Psch = mpc.bus(:,5) - mpc.bus(:,3);
+    Qsch = mpc.bus(:,6) - mpc.bus(:,4);
+    pv   = find(bt==2);
+    pq   = find(bt==3);
+    thf  = setdiff((1:n)',sl);
+    vi   = pq;
+    theta = zeros(n,1);
+    Vmag  = mpc.bus(:,7);
+    pf_ok = false;
+    if any(Vmag<0.5|Vmag>1.5|~isfinite(Vmag)), Vmag=ones(n,1); end
+    for gamma = 0.2:0.2:1.0
+        Ps = gamma*Psch; Qs = gamma*Qsch;
+        for it = 1:300
+            V    = Vmag.*exp(1i*theta);
+            Sinj = V.*conj(Ybus*V);
+            mis  = [Ps(thf)-real(Sinj(thf)); Qs(vi)-imag(Sinj(vi))];
+            if norm(mis,inf)<1e-7
+                if gamma>=0.99
+                    pf_ok = true;
+                    theta = theta-theta(sl);
+                    return;
+                else
+                    break;
+                end
+            end
+            J = pf_jac_general(Vmag,theta,Ybus,n,thf,vi);
+            if isempty(J)||any(~isfinite(J(:))), break; end
+            if rcond(full(J))<1e-12
+                J=J+1e-5*eye(size(J))*max(1,trace(abs(J))/size(J,1));
+            end
+            dx = J\mis; dx(~isfinite(dx))=0;
+            if norm(dx,inf)>0.15, dx=dx*(0.15/norm(dx,inf)); end
+            nt=numel(thf);
+            theta(thf)=theta(thf)+dx(1:nt);
+            Vmag(vi)  =Vmag(vi)+dx(nt+1:end);
+            Vmag(pv)  =mpc.bus(pv,7);
+            Vmag=max(0.5,min(1.5,Vmag));
+        end
+        if pf_ok, break; end
+    end
+    theta=theta-theta(sl);
+end
+
+function J = pf_jac_general(Vmag,theta,Ybus,n,thi,vi)
+    V    = Vmag.*exp(1i*theta);
+    I    = Ybus*V;
+    dV   = diag(V);
+    dI   = diag(I);
+    dVn  = diag(V./max(abs(V),1e-9));
+    dSth = 1i*dV*conj(dI-Ybus*dV);
+    dSV  = dV*conj(Ybus*dVn)+dI*conj(dVn);
+    J    = [real(dSth(thi,thi)),real(dSV(thi,vi));
+            imag(dSth(vi,thi)), imag(dSV(vi,vi))];
+    J(~isfinite(J))=0;
+end
+
+function pb = get_pmu_buses(num, n)
+    switch num
+        case 11, pb = [1 4 8];
+        case 13, pb = [1 6 8];
+        case 20, pb = [1 17 20];
+        case 14, pb = [1 6 9];
+        case 57, pb = round(linspace(1, n, 10));
+        otherwise, pb = [1 round(n/2) n];
+    end
+    pb = pb(pb >= 1 & pb <= n);
+end
+
+function mpc = build_mpc(num)
+    switch num
+        case 11
+            busdat = [
+                1   1   1.024   0    0  0   0      0      0  0
+                2   3   1       0    0  0   0      0      0  0
+                3   3   1       0    0  0  -0.128 -0.062  0  0
+                4   3   1       0    0  0   0      0      0  0
+                5   3   1       0    0  0  -0.165 -0.080  0  0
+                6   3   1       0    0  0  -0.090 -0.068  0  0
+                7   3   1       0    0  0   0      0      0  0
+                8   3   1       0    0  0   0      0      0  0
+                9   3   1       0    0  0  -0.026 -0.009  0  0
+               10   3   1       0    0  0   0      0      0  0
+               11   3   1       0    0  0  -0.158 -0.057  0  0];
+            linedat = [
+                1   2   0        0.0706   0    1
+                2   3   0        0.154    0    1
+                2   4   0.0377   0.0413   0    1
+                3   5   0.1228   0.1803   0    1
+                4   5   0        0.4593   0    1
+                4   6   0        0.0176   0    1
+                4   7   0.6114   0.8117   0    1
+                7   8   0.6209   0.2167   0    1
+                8   9   0.0718   0.7179   0    1
+                8  10   0.4097   0.5600   0    1
+               10  11   0.0264   0.2646   0    1];
+
+        case 13
+            busdat = [
+                1   1   1       0    0    0    1.65   0.56   0  0
+                2   3   1.05    0    0    0    0      0      0  0
+                3   3   1.05    0    0    0    0      0      0  0
+                4   3   1.05    0    0    0    0      0      0  0
+                5   2   1       0    0    0    0      0      0  0
+                6   2   1.037   0    0.5  0    0.05   0.03   0  0
+                7   3   1.05    0    0    0    0      0      0  0
+                8   2   1.1     0    0    0    0      0      0  0
+                9   2   0.943   0    0.5  0    0      0      0  0
+               10   2   1.1     0    0    0    0      0      0  0
+               11   3   1.05    0    0    0    0.05   0.03   0  0
+               12   3   1.05    0    0    0    0.05   0.032  0  0
+               13   3   1.05    0    0    0    0      0      0  0];
+            linedat = [
+                1   2   0.004   0.085    0        0.05
+                1   3   0.004   0.0947   0        0.1
+                5   4   0.004   0.0947   0        0.1
+                4   3   0.0074  0.143    0.218    1
+                6   2   0.0481  0.459    0.123    1
+                6   7   0.009   0.108    0.008    1
+                8   3   0.0121  0.233    0.356    1
+                7   8   0       0.15     0        1
+                9  10   0.0105  0.202    0.31     1
+               10  11   0      -0.15     0        1
+               11  12   0.0086  0.1665   0.254    1
+               12  13   0.0075  0.1465   0.224    1
+               13   8   0      -0.15     0       -1];
+
+        case 20
+            busdat = [
+                1   3   1  0   0    0  150   30  0  0
+                2   3   1  0   0    0   10    0  0  0
+                3   3   1  0   0    0    0    0  0  0
+                4   3   1  0   0    0  380   60  0  0
+                5   3   1  0   0    0    0    0  0  0
+                6   3   1  0   0    0    0    0  0  0
+                7   3   1  0   0    0   20    0  0  0
+                8   3   1  0   0    0   10   20  0  0
+                9   3   1  0   0    0    0    0  0  0
+               10   3   1  0   0    0   50   10  0  0
+               11   3   1  0   0    0    0    0  0  0
+               12   3   1  0   0    0    0    0  0  0
+               13   3   1  0   0    0    0    0  0  0
+               14   3   1  0   0    0    0   10  0  0
+               15   3   1  0   0    0    0    0  0  0
+               16   3   1  0   0    0   10    0  0  0
+               17   2   1  0  100   0    0    0  0  0
+               18   2   1  0  100   0    0    0  0  0
+               19   2   1  0  100   0    0    0  0  0
+               20   1   1  0   0    0    0    0  0  0];
+            linedat = [
+                1  20   0.5     5       0.012     1
+                2   8   0.5     5       0.0335    1
+                2  16   0       5       0         1
+                2  17  60      60       0         1
+                3   5  20      20       0         1
+                3  20   0.11    1.52    0.04285   1
+                4  17   3       4       0.025     1
+                4  20   5      10       0.125     1
+                5  14  30      40       0         1
+                6  15   5      10       0         1
+                6  16  60      80       0         1
+                6  17   0.6     8       0.02      1
+                7  12   0.5     5       0.025     1
+                9  10   0.5     5       0.025     1
+                9  19   0.1     3       0.05      1
+               10  11   0      30       0         1
+               11  12   2      40       0.012     1
+               11  13   0      15       0         1
+               13  18   0.5     6       0.015     1
+               14  19   0.1     1       0         1
+               15  18   0.15    1.5     0         1
+               15  20   2       4       0.0335    1];
+
+        otherwise
+            error('Unknown system: %d', num);
+    end
+
+    n   = size(busdat,1);
+    nb_ = size(linedat,1);
+
+    mpc.bus = zeros(n,7);
+    for i = 1:n
+        mpc.bus(i,:) = [busdat(i,1), busdat(i,2), busdat(i,7), busdat(i,8), ...
+                        busdat(i,5), busdat(i,6), busdat(i,3)];
+    end
+
+    mpc.branch = zeros(nb_,6);
+    for k = 1:nb_
+        tap = linedat(k,6);
+        if tap == 0, tap = 1; end
+        mpc.branch(k,:) = [linedat(k,1), linedat(k,2), linedat(k,3), ...
+                           linedat(k,4), linedat(k,5), tap];
+    end
+    mpc.n = n;
+end
+
+function mpc = build_ieee14_mpc()
+    rawbus = [1,3,0.000,0.000,2.324,-0.169,1.060; 2,2,0.217,0.127,0.400,0.424,1.045;
+        3,2,0.942,0.190,0.000,0.234,1.010; 4,1,0.478,-0.039,0.000,0.000,1.000;
+        5,1,0.076,0.016,0.000,0.000,1.000; 6,2,0.112,0.075,0.000,0.122,1.070;
+        7,1,0.000,0.000,0.000,0.000,1.000; 8,2,0.000,0.000,0.000,0.174,1.090;
+        9,1,0.295,0.166,0.000,0.000,1.000; 10,1,0.090,0.058,0.000,0.000,1.000;
+        11,1,0.035,0.018,0.000,0.000,1.000; 12,1,0.061,0.016,0.000,0.000,1.000;
+        13,1,0.135,0.058,0.000,0.000,1.000; 14,1,0.149,0.050,0.000,0.000,1.000];
+    branch = [1,2,0.01938,0.05917,0.0528,1.000; 1,5,0.05403,0.22304,0.0492,1.000;
+        2,3,0.04699,0.19797,0.0438,1.000; 2,4,0.05811,0.17632,0.0340,1.000;
+        2,5,0.05695,0.17388,0.0346,1.000; 3,4,0.06701,0.17103,0.0128,1.000;
+        4,5,0.01335,0.04211,0.0000,1.000; 4,7,0.00000,0.20912,0.0000,0.978;
+        4,9,0.00000,0.55618,0.0000,0.969; 5,6,0.00000,0.25202,0.0000,0.932;
+        6,11,0.09498,0.19890,0.0000,1.000; 6,12,0.12291,0.25581,0.0000,1.000;
+        6,13,0.06615,0.13027,0.0000,1.000; 7,8,0.00000,0.17615,0.0000,1.000;
+        7,9,0.00000,0.11001,0.0000,1.000; 9,10,0.03181,0.08450,0.0000,1.000;
+        9,14,0.12711,0.27038,0.0000,1.000; 10,11,0.08205,0.19207,0.0000,1.000;
+        12,13,0.22092,0.19988,0.0000,1.000; 13,14,0.17093,0.34802,0.0000,1.000];
+    n = size(rawbus,1);
+    mpc.bus = zeros(n,7);
+    for i = 1:n
+        ot = rawbus(i,2);
+        if ot==3, it=1; elseif ot==2, it=2; else, it=3; end
+        mpc.bus(i,:) = [rawbus(i,1),it,rawbus(i,3),rawbus(i,4), ...
+                        rawbus(i,5),rawbus(i,6),rawbus(i,7)];
+    end
+    mpc.branch = branch;
+    mpc.n = n;
+end
